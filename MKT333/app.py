@@ -23,7 +23,7 @@ from huggingface_hub import InferenceClient
 # -----------------------------
 # Config
 # -----------------------------
-PDF_DIR = os.path.join(os.path.dirname(__file__), "pdfs")
+PDF_DIR = os.path.join(os.path.dirname(__file__), "knowledge_base")
 INDEX_DIR = os.path.join(os.path.dirname(__file__), "index")
 FAISS_PATH = os.path.join(INDEX_DIR, "faiss.index")
 META_PATH = os.path.join(INDEX_DIR, "meta.json")
@@ -388,3 +388,4 @@ if prompt:
             st.markdown(answer)
 
     st.session_state.messages.append({"role": "assistant", "content": answer})
+
