@@ -1,6 +1,6 @@
 ###########################################
-# MKT 333 — Beer • AI • Video Games
-# Streamlit RAG + Hugging Face Inference (Option 3)
+# MKT 333 — Course PDF Chatbot (Streamlit)
+# Option 3: Hugging Face Inference (no Ollama)
 ###########################################
 
 from __future__ import annotations
@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 import re
 import json
-from typing import List, Dict, Any, Optional, Tuple
+from typing import Optional, List, Dict, Any, Tuple
 
 import streamlit as st
 import fitz  # PyMuPDF
@@ -16,54 +16,46 @@ import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-from huggingface_hub import HfApi
-from huggingface_hub import InferenceClient
-
+from huggingface_hub import HfApi, InferenceClient
+from huggingface_hub.errors import HfHubHTTPError
 
 # -----------------------------
 # Config
 # -----------------------------
 PDF_DIR = os.path.join(os.path.dirname(__file__), "knowledge_base")
-INDEX_DIR = os.path.join(os.path.dirname(__file__), "index")
-FAISS_PATH = os.path.join(INDEX_DIR, "faiss.index")
-META_PATH = os.path.join(INDEX_DIR, "meta.json")
 
-EMBED_MODEL_ID = "BAAI/bge-small-en-v1.5"  # embeddings
-DEFAULT_LLM_MODEL_ID = "meta-llama/Meta-Llama-3-8B-Instruct"  # pick any public instruct model
-DEFAULT_PROVIDER = "hf-inference"  # you can also try "auto" if available in your version
+# Embedding model (public; should work WITHOUT token)
+EMBED_MODEL_ID = "BAAI/bge-small-en-v1.5"
 
-CHUNK_MAX_CHARS = 1400
-CHUNK_OVERLAP_CHARS = 180
+# HF chat model (you can override with env/secrets: HF_LLM_MODEL)
+DEFAULT_HF_LLM_MODEL = "mistralai/Mistral-7B-Instruct-v0.3"
+
+CHUNK_MAX_CHARS = 1200
+CHUNK_OVERLAP = 150
 TOP_K = 5
 
-
 # -----------------------------
-# Page config
+# Helpers: env/secrets
 # -----------------------------
-st.set_page_config(
-    page_title="MKT 333 — Beer • AI & Video Games",
-    page_icon="🍺",
-    layout="centered",
-    initial_sidebar_state="expanded",
-)
-
-
-# -----------------------------
-# HF Token handling
-# -----------------------------
-def get_hf_token() -> Optional[str]:
-    # Streamlit Cloud secrets
+def get_secret(name: str) -> Optional[str]:
+    # Streamlit secrets first
     try:
-        tok = st.secrets.get("HF_TOKEN", None)
-        if tok:
-            return str(tok).strip()
+        v = st.secrets.get(name, None)
+        if v:
+            return str(v).strip()
     except Exception:
         pass
+    # Env vars next
+    v = os.getenv(name)
+    return v.strip() if v else None
 
-    # Local env vars (PowerShell: $env:HF_TOKEN="...")
-    tok = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN")
-    return tok.strip() if tok else None
-
+def get_hf_token() -> Optional[str]:
+    # Common env var names
+    return (
+        get_secret("HF_TOKEN")
+        or get_secret("HUGGINGFACEHUB_API_TOKEN")
+        or get_secret("HUGGINGFACE_API_TOKEN")
+    )
 
 def validate_hf_token(token: str) -> bool:
     try:
@@ -72,25 +64,26 @@ def validate_hf_token(token: str) -> bool:
     except Exception:
         return False
 
-
+# Read + validate token (IMPORTANT: if invalid, remove it so public downloads still work)
 HF_TOKEN = get_hf_token()
 if HF_TOKEN and not validate_hf_token(HF_TOKEN):
-    # If token is wrong, Hugging Face requests can fail even for public models.
-    st.warning("HF_TOKEN looks invalid. Ignoring it and continuing without auth.")
+    # If your env has a stale token, huggingface libs may send it and fail.
+    # Remove it so public model downloads work.
     HF_TOKEN = None
-    # Also remove env vars so downstream libraries don't keep using a bad token:
     os.environ.pop("HF_TOKEN", None)
     os.environ.pop("HUGGINGFACEHUB_API_TOKEN", None)
+    os.environ.pop("HUGGINGFACE_API_TOKEN", None)
+
+HF_LLM_MODEL = get_secret("HF_LLM_MODEL") or DEFAULT_HF_LLM_MODEL
 
 
 # -----------------------------
-# Text cleanup / chunking
+# PDF + text utils
 # -----------------------------
 def clean_text(t: str) -> str:
     t = re.sub(r"\n\s*\n+", "\n", t)
-    t = re.sub(r"Page\s+\d+\s*", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"Page\s+\d+", "", t, flags=re.IGNORECASE)
     return t.strip()
-
 
 def extract_text_from_pdf(pdf_path: str) -> str:
     text = ""
@@ -98,7 +91,6 @@ def extract_text_from_pdf(pdf_path: str) -> str:
         for page in doc:
             t = page.get_text("text") or ""
             if not t.strip():
-                # fallback
                 blocks = page.get_text("blocks") or []
                 t = "\n".join(
                     [b[4] for b in blocks if len(b) > 4 and isinstance(b[4], str)]
@@ -106,8 +98,8 @@ def extract_text_from_pdf(pdf_path: str) -> str:
             text += t + "\n"
     return clean_text(text)
 
-
-def split_text(text: str, max_chars: int = CHUNK_MAX_CHARS, overlap: int = CHUNK_OVERLAP_CHARS) -> List[str]:
+def split_text(text: str, max_chars: int = CHUNK_MAX_CHARS, overlap: int = CHUNK_OVERLAP) -> List[str]:
+    # stable newline-based chunking
     lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
     chunks: List[str] = []
     buf = ""
@@ -116,276 +108,385 @@ def split_text(text: str, max_chars: int = CHUNK_MAX_CHARS, overlap: int = CHUNK
         if len(buf) + len(ln) + 1 <= max_chars:
             buf += ln + "\n"
         else:
-            if buf.strip():
-                chunks.append(buf.strip())
-            # overlap
-            tail = buf[-overlap:] if overlap and len(buf) > overlap else ""
-            buf = tail + ln + "\n"
+            chunks.append(buf.strip())
+            keep = buf[-overlap:] if overlap and len(buf) > overlap else ""
+            buf = keep + ln + "\n"
 
     if buf.strip():
         chunks.append(buf.strip())
 
-    return chunks
-
+    # final safety
+    return [c for c in chunks if c.strip()]
 
 def pdf_signature() -> str:
-    os.makedirs(PDF_DIR, exist_ok=True)
-    files = [f for f in os.listdir(PDF_DIR) if f.lower().endswith(".pdf")]
+    if not os.path.exists(PDF_DIR):
+        return "[]"
+    files = sorted([f for f in os.listdir(PDF_DIR) if f.lower().endswith(".pdf")])
     sig = []
-    for fn in sorted(files):
-        p = os.path.join(PDF_DIR, fn)
+    for f in files:
+        p = os.path.join(PDF_DIR, f)
         try:
-            sig.append((fn, os.path.getmtime(p), os.path.getsize(p)))
+            sig.append((f, os.path.getmtime(p), os.path.getsize(p)))
         except Exception:
-            sig.append((fn, 0, 0))
+            sig.append((f, 0, 0))
     return json.dumps(sig)
 
 
 # -----------------------------
-# Embeddings model (cached)
+# Cached embedder + index build
 # -----------------------------
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def get_embedder() -> SentenceTransformer:
-    # IMPORTANT: don’t hard-fail if HF_TOKEN is missing; public model should load normally.
+    # Do NOT pass token here; public model should load without it.
     return SentenceTransformer(EMBED_MODEL_ID)
 
-
-# -----------------------------
-# Index build/load (cached)
-# -----------------------------
-def ensure_dirs():
+def build_faiss_index(sig: str) -> Tuple[Optional[faiss.IndexFlatIP], List[str], List[Dict[str, Any]]]:
+    """
+    Build a cosine-similarity FAISS index (IndexFlatIP on normalized vectors).
+    Cache is controlled by `sig` so it rebuilds when PDFs change.
+    """
     os.makedirs(PDF_DIR, exist_ok=True)
-    os.makedirs(INDEX_DIR, exist_ok=True)
+    files = sorted([f for f in os.listdir(PDF_DIR) if f.lower().endswith(".pdf")])
 
-
-def build_index(embedder: SentenceTransformer) -> Tuple[Optional[faiss.IndexFlatIP], List[str], List[Dict[str, Any]]]:
-    ensure_dirs()
-    files = [f for f in os.listdir(PDF_DIR) if f.lower().endswith(".pdf")]
+    embedder = get_embedder()
 
     all_chunks: List[str] = []
-    all_meta: List[Dict[str, Any]] = []
+    meta: List[Dict[str, Any]] = []
 
     for fn in files:
         path = os.path.join(PDF_DIR, fn)
         txt = extract_text_from_pdf(path)
         if not txt.strip():
             continue
-
-        chunks = [c for c in split_text(txt) if c.strip()]
-        for i, c in enumerate(chunks):
-            all_chunks.append(c)
-            all_meta.append({"file": fn, "chunk": i})
+        chunks = split_text(txt)
+        all_chunks.extend(chunks)
+        meta.extend([{"file": fn, "chunk": i} for i in range(len(chunks))])
 
     if not all_chunks:
-        # save empty meta
-        with open(META_PATH, "w", encoding="utf-8") as f:
-            json.dump({"sig": pdf_signature(), "chunks": [], "meta": []}, f)
         return None, [], []
 
-    embs = embedder.encode(all_chunks, convert_to_numpy=True, show_progress_bar=False).astype(np.float32)
+    # embeddings (normalized)
+    emb = embedder.encode(
+        all_chunks,
+        convert_to_numpy=True,
+        show_progress_bar=False,
+        normalize_embeddings=True,
+    ).astype(np.float32)
 
-    # Use cosine similarity (normalize + inner product)
-    faiss.normalize_L2(embs)
-    dim = embs.shape[1]
-    idx = faiss.IndexFlatIP(dim)
-    idx.add(embs)
-
-    faiss.write_index(idx, FAISS_PATH)
-    with open(META_PATH, "w", encoding="utf-8") as f:
-        json.dump({"sig": pdf_signature(), "chunks": all_chunks, "meta": all_meta}, f)
-
-    return idx, all_chunks, all_meta
-
-
-@st.cache_resource
-def load_or_build_index() -> Tuple[Optional[faiss.IndexFlatIP], List[str], List[Dict[str, Any]]]:
-    ensure_dirs()
-    embedder = get_embedder()
-
-    if os.path.exists(FAISS_PATH) and os.path.exists(META_PATH):
-        try:
-            with open(META_PATH, "r", encoding="utf-8") as f:
-                blob = json.load(f)
-            if blob.get("sig") == pdf_signature():
-                idx = faiss.read_index(FAISS_PATH)
-                return idx, blob.get("chunks", []), blob.get("meta", [])
-        except Exception:
-            pass
-
-    return build_index(embedder)
+    dim = emb.shape[1]
+    index = faiss.IndexFlatIP(dim)
+    index.add(emb)
+    return index, all_chunks, meta
 
 
-def retrieve(query: str, idx: Optional[faiss.IndexFlatIP], chunks: List[str], meta: List[Dict[str, Any]], k: int = TOP_K):
-    if idx is None or not chunks:
+def retrieve(query: str, index: Optional[faiss.IndexFlatIP], chunks: List[str], meta: List[Dict[str, Any]], k: int = TOP_K):
+    if index is None or not chunks:
         return [], []
 
     embedder = get_embedder()
-    q = embedder.encode([query], convert_to_numpy=True, show_progress_bar=False).astype(np.float32)
-    faiss.normalize_L2(q)
+    q = embedder.encode([query], convert_to_numpy=True, show_progress_bar=False, normalize_embeddings=True).astype(np.float32)
+    scores, idxs = index.search(q, k)
+    idxs = idxs[0].tolist()
 
-    scores, ids = idx.search(q, k)
-    ids = ids[0].tolist()
-
-    picked_chunks = []
-    picked_meta = []
-    for i in ids:
+    ctx = []
+    m = []
+    for i in idxs:
         if i == -1:
             continue
-        picked_chunks.append(chunks[i])
-        picked_meta.append(meta[i])
-    return picked_chunks, picked_meta
+        ctx.append(chunks[i])
+        m.append(meta[i])
+    return ctx, m
 
 
 # -----------------------------
-# HF LLM call (chat -> fallback to text_generation)
+# HF LLM call (Chat completion + fallback)
 # -----------------------------
-def build_prompt(question: str, contexts: List[str], meta: List[Dict[str, Any]]) -> Tuple[List[Dict[str, str]], str]:
-    # for chat_completion
-    sys = (
-        "You are a course assistant. Answer ONLY using the provided excerpts.\n"
-        "If the answer is not in the excerpts, say: 'I don’t have enough information in the PDFs to answer that.'\n"
-        "Cite sources at the end like: (FileName.pdf, chunk 3)."
-    )
-
-    ctx_lines = []
-    for c, m in zip(contexts, meta):
-        ctx_lines.append(f"[{m['file']}, chunk {m['chunk']}]\n{c}")
-
-    ctx_block = "\n\n---\n\n".join(ctx_lines) if ctx_lines else "(no excerpts)"
-
-    user = f"Question: {question}\n\nExcerpts:\n{ctx_block}\n\nAnswer:"
-
-    messages = [
-        {"role": "system", "content": sys},
-        {"role": "user", "content": user},
-    ]
-
-    # for text_generation fallback (single string)
-    flat_prompt = f"{sys}\n\n{user}"
-    return messages, flat_prompt
-
-
 def call_hf_llm(
-    model_id: str,
-    provider: str,
     question: str,
     contexts: List[str],
-    meta: List[Dict[str, Any]],
-    temperature: float = 0.2,
-    max_tokens: int = 600,
+    citations: List[Dict[str, Any]],
+    model_id: str,
+    temperature: float,
+    max_tokens: int,
 ) -> str:
-    client = InferenceClient(model=model_id, token=HF_TOKEN, provider=provider)
+    # Build labeled context
+    labeled = []
+    for i, (c, m) in enumerate(zip(contexts, citations), start=1):
+        labeled.append(f"[S{i}] ({m['file']} • chunk {m['chunk']})\n{c}")
 
-    messages, flat_prompt = build_prompt(question, contexts, meta)
+    context_block = "\n\n".join(labeled) if labeled else "(no context)"
 
-    # 1) Try chat_completion (ONLY works if model/provider supports chat-completion)
+    system = (
+        "You are a course assistant. Answer ONLY using the provided sources.\n"
+        "If the answer is not in the sources, say: \"I don’t have enough information in the PDFs to answer that.\"\n"
+        "When you use a source, add citations like [S1], [S2] in the answer.\n"
+    )
+    user = (
+        f"Question:\n{question}\n\n"
+        f"Sources:\n{context_block}\n\n"
+        "Write a clear, helpful answer with bullet points if needed.\n"
+    )
+
+    client = InferenceClient(model=model_id, token=HF_TOKEN)  # token can be None
+
+    # Try chat_completion first
     try:
         resp = client.chat_completion(
-            messages=messages,
-            max_tokens=max_tokens,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
             temperature=float(temperature),
+            max_tokens=int(max_tokens),
         )
-        # huggingface_hub returns an object with choices[0].message.content
-        return (resp.choices[0].message.content or "").strip()
+        # huggingface_hub returns OpenAI-like response objects
+        return resp.choices[0].message["content"].strip()
 
-    except ValueError:
-        # Model doesn’t support chat-completion task -> fall back to text_generation
-        # text_generation params documented here. :contentReference[oaicite:1]{index=1}
-        out = client.text_generation(
-            prompt=flat_prompt,
-            max_new_tokens=max_tokens,
-            temperature=float(temperature),
-            do_sample=(float(temperature) > 0),
-            return_full_text=False,
+    except HfHubHTTPError as e:
+        # Log full details (Streamlit Cloud logs will show it)
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        st.error(
+            f"HF Inference error (chat): status={status}. "
+            f"Check Streamlit logs for the full error text (often 401/403/404/429/503)."
         )
-        return (out or "").strip()
+        # Fallback to text_generation (some models don’t support chat endpoint)
+        try:
+            prompt = system + "\n\n" + user + "\nAnswer:"
+            out = client.text_generation(
+                prompt,
+                max_new_tokens=int(max_tokens),
+                temperature=float(temperature),
+            )
+            return str(out).strip()
+        except Exception:
+            raise
+
+    except Exception as e:
+        st.error("Unexpected LLM error. Check logs.")
+        raise
 
 
 # -----------------------------
-# UI
+# Streamlit UI
 # -----------------------------
-if "messages" not in st.session_state:
-    st.session_state.messages = [{"role": "assistant", "content": "Hi! Ask me anything from the MKT 333 PDFs. 🍺🎮🤖"}]
+st.set_page_config(
+    page_title="MKT 333 — Beer AI & Video Games",
+    page_icon="🍺",
+    layout="centered",
+    initial_sidebar_state="expanded",
+)
 
+# Theme state
 if "ui_dark_mode" not in st.session_state:
     st.session_state.ui_dark_mode = True
 
-if "model_config" not in st.session_state:
-    st.session_state.model_config = {"temperature": 0.2, "max_tokens": 700}
-
-# Header
-left, right = st.columns([0.85, 0.15], vertical_alignment="center")
+left, right = st.columns([0.97, 0.20], vertical_alignment="center")
 with left:
     st.markdown(
         """
-        <div style="padding:14px 16px; border:1px solid rgba(231,234,240,0.12); border-radius:16px; text-align:center;">
-          <div style="font-size:1.65rem; font-weight:900;">Beer • AI • Video Games</div>
-          <div style="opacity:0.75; margin-top:4px;">Ask the course PDFs. Get clean, cited answers.</div>
+        <div class="top-banner">
+          <div class="hero-title">Beer • AI • Video Games</div>
+          <div class="hero-sub">Ask the course PDFs. Get clean, cited answers.</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 with right:
-    st.session_state.ui_dark_mode = st.toggle("Dark", value=st.session_state.ui_dark_mode)
+    st.session_state.ui_dark_mode = st.toggle("Dark mode", value=st.session_state.ui_dark_mode)
+
+# Theme colors
+if st.session_state.ui_dark_mode:
+    bg = "#0b0d12"
+    panel = "rgba(15, 18, 28, 0.86)"
+    text = "#e7eaf0"
+    mut = "#a7b0c0"
+    border = "rgba(231,234,240,0.12)"
+    accent2 = "#ffcc00"
+    user_bg = "rgba(30, 34, 46, 0.92)"
+    ai_bg = "rgba(153, 0, 0, 0.22)"
+    input_bg = "rgba(12, 14, 22, 0.85)"
+else:
+    bg = "#fafafa"
+    panel = "rgba(255,255,255,0.92)"
+    text = "#0b1220"
+    mut = "#4b5563"
+    border = "rgba(11,18,32,0.10)"
+    accent2 = "#b38600"
+    user_bg = "rgba(248,250,252,0.98)"
+    ai_bg = "rgba(153, 0, 0, 0.10)"
+    input_bg = "rgba(255,255,255,0.98)"
+
+st.markdown(
+    f"""
+<style>
+.stApp {{ background: {bg}; color: {text}; }}
+.block-container {{ padding-top: 1.10rem; max-width: 980px; }}
+
+.top-banner {{
+  background: {panel};
+  border: 1px solid {border};
+  border-radius: 18px;
+  padding: 18px 18px;
+  text-align: center;
+}}
+.hero-title {{ margin-top: 8px; font-size: 1.70rem; font-weight: 900; }}
+.hero-sub {{ margin-top: 6px; font-size: 1.02rem; color: {mut}; }}
+
+.stChatMessage {{
+  padding: 1.05rem 1.10rem;
+  border-radius: 18px;
+  margin: 0.80rem 0;
+  max-width: 88%;
+  border: 1px solid {border};
+  background: {panel};
+}}
+[data-testid="stChatMessage"][aria-label="user"] {{
+  background: {user_bg};
+  margin-left: auto;
+}}
+[data-testid="stChatMessage"][aria-label="assistant"] {{
+  background: {ai_bg};
+  margin-right: auto;
+}}
+[data-testid="stChatMessage"] * {{
+  color: {text} !important;
+}}
+[data-testid="stChatMessage"] a {{
+  color: {accent2} !important;
+}}
+
+.stChatInput textarea {{
+  background: {input_bg} !important;
+  color: {text} !important;
+  border-radius: 16px !important;
+  border: 1px solid {border} !important;
+  font-size: 1.08rem !important;
+  line-height: 1.45 !important;
+  min-height: 72px !important;
+  padding: 14px 16px !important;
+}}
+.stChatInput textarea::placeholder {{ color: {mut} !important; }}
+
+.sidebar-card {{
+  background: rgba(15, 18, 28, 0.86);
+  border: 1px solid rgba(231,234,240,0.12);
+  border-radius: 18px;
+  padding: 16px;
+}}
+.sidebar-title {{ font-weight: 900; font-size: 1.05rem; margin: 0; }}
+.sidebar-sub {{ margin-top: 8px; color: rgba(167,176,192,1); font-size: 0.95rem; }}
+.sidebar-badge {{
+  display: inline-block;
+  margin-left: 10px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: rgba(255,204,0,0.12);
+  border: 1px solid rgba(255,204,0,0.22);
+  color: rgba(231,234,240,1);
+  font-size: 0.78rem;
+  font-weight: 800;
+}}
+.sidebar-links a {{
+  display: block;
+  text-decoration: none;
+  margin-top: 12px;
+  padding: 16px 14px;
+  border-radius: 14px;
+  border: 1px solid rgba(231,234,240,0.10);
+  background: rgba(12, 14, 22, 0.75);
+  color: rgba(231,234,240,1) !important;
+  font-weight: 700;
+}}
+.sidebar-links a:hover {{
+  border-color: rgba(255,204,0,0.35);
+  box-shadow: 0 0 0 2px rgba(255,204,0,0.08);
+}}
+</style>
+""",
+    unsafe_allow_html=True,
+)
 
 # Sidebar
 with st.sidebar:
-    st.markdown("### Backend")
-    idx, chunks, meta = load_or_build_index()
-    pdf_count = len([f for f in os.listdir(PDF_DIR) if f.lower().endswith(".pdf")]) if os.path.exists(PDF_DIR) else 0
-    st.write(f"**PDFs:** {pdf_count}")
-    st.write(f"**Chunks:** {len(chunks)}")
-    st.write(f"**Indexed:** {idx is not None}")
+    st.markdown(
+        """
+        <div class="sidebar-card">
+          <div class="sidebar-title">USC Links <span class="sidebar-badge">Quick</span></div>
+          <div class="sidebar-sub">Open official pages in a new tab.</div>
+          <div class="sidebar-links">
+            <a href="https://www.usc.edu" target="_blank">USC — University of Southern California</a>
+            <a href="https://gould.usc.edu/faculty/profile/d-daniel-sokol/" target="_blank">Professor D. Sokol</a>
+            <a href="https://www.marshall.usc.edu" target="_blank">USC Marshall School of Business</a>
+            <a href="https://www.marshall.usc.edu/departments/marketing" target="_blank">Marshall Marketing Department</a>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     st.divider()
-    st.markdown("### Hugging Face LLM")
-    model_id = st.text_input("Model ID", value=DEFAULT_LLM_MODEL_ID)
-    provider = st.text_input("Provider", value=DEFAULT_PROVIDER)
+    st.subheader("HF Settings")
+    st.caption("Set HF_TOKEN in Streamlit secrets or PowerShell env. Optionally set HF_LLM_MODEL.")
+    st.text_input("HF model id", value=HF_LLM_MODEL, key="hf_model_id")
 
-    st.divider()
-    st.markdown("### Settings")
-    st.session_state.model_config["temperature"] = st.slider("Temperature", 0.0, 1.0, float(st.session_state.model_config["temperature"]), 0.05)
-    st.session_state.model_config["max_tokens"] = st.slider("Max tokens", 128, 1200, int(st.session_state.model_config["max_tokens"]), 32)
+    st.subheader("Generation")
+    st.session_state.setdefault("temperature", 0.2)
+    st.session_state.setdefault("max_tokens", 512)
+    st.session_state.temperature = st.slider("Temperature", 0.0, 1.0, float(st.session_state.temperature), 0.05)
+    st.session_state.max_tokens = st.slider("Max tokens", 64, 1024, int(st.session_state.max_tokens), 64)
 
-    if st.button("🔁 Reindex PDFs"):
-        # Clear cache + rebuild on next load
-        load_or_build_index.clear()
-        st.rerun()
+# Session init
+if "messages" not in st.session_state:
+    st.session_state.messages = [{
+        "role": "assistant",
+        "content": "Hi! Ask me anything from the MKT 333 PDFs. 🍺🎮🤖"
+    }]
 
-# Chat history
-for m in st.session_state.messages:
-    with st.chat_message("assistant" if m["role"] == "assistant" else "user"):
-        st.markdown(m["content"])
+# Build / load index (cache keyed by signature)
+sig = pdf_signature()
+with st.spinner("Loading PDFs + building index (first run can take a bit)..."):
+    index, chunks, meta = build_faiss_index(sig)
+
+pdf_count = len([f for f in os.listdir(PDF_DIR) if f.lower().endswith(".pdf")]) if os.path.exists(PDF_DIR) else 0
+chunk_count = len(chunks)
+
+st.caption(f"● Backend: {'OK' if index is not None else 'NOT READY'} ({pdf_count} PDFs, {chunk_count} chunks)")
+
+# Show chat history
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
 
 # Input
-prompt = st.chat_input("Type your message...")
-if prompt:
+if prompt := st.chat_input("Type your message..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Retrieve + Answer
-    idx, chunks, meta = load_or_build_index()
-    ctx, ctx_meta = retrieve(prompt, idx, chunks, meta, TOP_K)
+    # Retrieve
+    contexts, cites = retrieve(prompt, index, chunks, meta, TOP_K)
 
     with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
-            answer = call_hf_llm(
-                model_id=model_id.strip(),
-                provider=provider.strip(),
-                question=prompt,
-                contexts=ctx,
-                meta=ctx_meta,
-                temperature=float(st.session_state.model_config["temperature"]),
-                max_tokens=int(st.session_state.model_config["max_tokens"]),
-            )
+        if not contexts:
+            st.markdown("I don’t have enough information in the PDFs to answer that. Try adding the syllabus PDF into `/pdfs` and refresh.")
+        else:
+            try:
+                answer = call_hf_llm(
+                    question=prompt,
+                    contexts=contexts,
+                    citations=cites,
+                    model_id=st.session_state.get("hf_model_id", HF_LLM_MODEL),
+                    temperature=float(st.session_state.temperature),
+                    max_tokens=int(st.session_state.max_tokens),
+                )
+                st.markdown(answer)
 
-            # (Optional) show sources at bottom
-            if ctx_meta:
-                cites = ", ".join([f"({m['file']}, chunk {m['chunk']})" for m in ctx_meta[:3]])
-                answer = f"{answer}\n\n**Sources:** {cites}"
+                # Show sources list (simple + useful)
+                with st.expander("Sources used"):
+                    for i, m in enumerate(cites, start=1):
+                        st.write(f"[S{i}] {m['file']} — chunk {m['chunk']}")
 
-            st.markdown(answer)
+                st.session_state.messages.append({"role": "assistant", "content": answer})
 
-    st.session_state.messages.append({"role": "assistant", "content": answer})
-
+            except Exception:
+                st.markdown("LLM call failed. Open Streamlit logs to see the exact status code/message.")
