@@ -1,0 +1,7 @@
+streamlit>=1.36
+ollama>=0.3.0
+pymupdf>=1.24.2
+faiss-cpu>=1.8.0.post1
+numpy>=1.26
+sentence-transformers>=3.0.0
+requests>=2.32.3
