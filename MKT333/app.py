@@ -20,7 +20,7 @@ from huggingface_hub.utils import HfHubHTTPError
 # -----------------------------
 # Config
 # -----------------------------
-PDF_DIR = os.path.join(os.path.dirname(__file__), "pdfs")
+PDF_DIR = os.path.join(os.path.dirname(__file__), "knowledge_base")
 
 # Embeddings
 EMBED_MODEL_PRIMARY = "BAAI/bge-small-en-v1.5"
@@ -356,3 +356,4 @@ if prompt:
             answer = "I couldn’t reach the Hugging Face chat endpoint for that model/provider."
 
     st.session_state.messages.append({"role": "assistant", "content": answer})
+
