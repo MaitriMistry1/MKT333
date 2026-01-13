@@ -28,7 +28,7 @@ PDF_DIR = os.path.join(os.path.dirname(__file__), "knowledge_base")
 EMBED_MODEL_ID = "BAAI/bge-small-en-v1.5"
 
 # HF chat model (you can override with env/secrets: HF_LLM_MODEL)
-DEFAULT_HF_LLM_MODEL = "mistralai/Mistral-7B-Instruct-v0.3"
+DEFAULT_HF_LLM_MODEL = "HuggingFaceH4/zephyr-7b-beta"
 
 CHUNK_MAX_CHARS = 1200
 CHUNK_OVERLAP = 150
@@ -178,6 +178,10 @@ def build_faiss_index(sig: str) -> Tuple[Optional[faiss.IndexFlatIP], List[str],
     index.add(emb)
     return index, all_chunks, meta
 
+@st.cache_resource(show_spinner=False)
+def get_index_bundle(sig: str):
+    # cached across reruns; rebuild only when sig changes
+    return build_faiss_index(sig)
 
 def retrieve(query: str, index: Optional[faiss.IndexFlatIP], chunks: List[str], meta: List[Dict[str, Any]], k: int = TOP_K):
     if index is None or not chunks:
@@ -209,29 +213,32 @@ def call_hf_llm(
     temperature: float,
     max_tokens: int,
 ) -> str:
-    # Build labeled context
+    # Label sources
     labeled = []
     for i, (c, m) in enumerate(zip(contexts, citations), start=1):
         labeled.append(f"[S{i}] ({m['file']} • chunk {m['chunk']})\n{c}")
-
     context_block = "\n\n".join(labeled) if labeled else "(no context)"
 
     system = (
-        "You are a course assistant. Answer ONLY using the provided sources.\n"
-        "If the answer is not in the sources, say: \"I don’t have enough information in the PDFs to answer that.\"\n"
-        "When you use a source, add citations like [S1], [S2] in the answer.\n"
+        "You are a course assistant.\n"
+        "Answer ONLY using the provided sources.\n"
+        "If the answer is not in the sources, say exactly:\n"
+        "\"I don’t have enough information in the PDFs to answer that.\"\n"
+        "When you use a source, cite it like [S1], [S2].\n"
     )
     user = (
         f"Question:\n{question}\n\n"
         f"Sources:\n{context_block}\n\n"
-        "Write a clear, helpful answer with bullet points if needed.\n"
+        "Write a clear, helpful answer. Use bullets if helpful.\n"
     )
 
-    client = InferenceClient(model=model_id, token=HF_TOKEN)  # token can be None
+    # Important: create client with token only, pass model_id per call
+    client = InferenceClient(token=HF_TOKEN)  # HF_TOKEN can be None
 
-    # Try chat_completion first
+    # 1) Try chat endpoint
     try:
         resp = client.chat_completion(
+            model=model_id,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
@@ -239,32 +246,40 @@ def call_hf_llm(
             temperature=float(temperature),
             max_tokens=int(max_tokens),
         )
-        # huggingface_hub returns OpenAI-like response objects
         return resp.choices[0].message["content"].strip()
 
     except HfHubHTTPError as e:
-        # Log full details (Streamlit Cloud logs will show it)
         status = getattr(getattr(e, "response", None), "status_code", None)
         st.error(
             f"HF Inference error (chat): status={status}. "
-            f"Check Streamlit logs for the full error text (often 401/403/404/429/503)."
+            f"If this is 401/403/404, your model likely isn’t available for chat on free HF Inference."
         )
-        # Fallback to text_generation (some models don’t support chat endpoint)
+
+        # 2) Fallback to text_generation for models that don’t support chat_completion
         try:
-            prompt = system + "\n\n" + user + "\nAnswer:"
+            prompt = f"{system}\n\n{user}\nAnswer:\n"
             out = client.text_generation(
-                prompt,
+                model=model_id,
+                prompt=prompt,
                 max_new_tokens=int(max_tokens),
                 temperature=float(temperature),
             )
             return str(out).strip()
-        except Exception:
-            raise
+        except HfHubHTTPError as e2:
+            status2 = getattr(getattr(e2, "response", None), "status_code", None)
+            st.error(
+                f"HF Inference error (text): status={status2}. "
+                f"Try setting HF_LLM_MODEL to 'HuggingFaceH4/zephyr-7b-beta' in Streamlit secrets."
+            )
+            # Final fallback: return top excerpts so the app still responds
+            return (
+                "I couldn’t call the hosted LLM right now, but here are the most relevant excerpts:\n\n"
+                + "\n\n---\n\n".join(contexts[:3])
+            )
 
-    except Exception as e:
+    except Exception:
         st.error("Unexpected LLM error. Check logs.")
         raise
-
 
 # -----------------------------
 # Streamlit UI
@@ -427,7 +442,7 @@ with st.sidebar:
     st.divider()
     st.subheader("HF Settings")
     st.caption("Set HF_TOKEN in Streamlit secrets or PowerShell env. Optionally set HF_LLM_MODEL.")
-    st.text_input("HF model id", value=HF_LLM_MODEL, key="hf_model_id")
+    st.text_input("HF model id", value=HF_LLM_MODEL, key="hf_model_id", help="Use a public HF Inference model like HuggingFaceH4/zephyr-7b-beta")
 
     st.subheader("Generation")
     st.session_state.setdefault("temperature", 0.2)
@@ -445,7 +460,7 @@ if "messages" not in st.session_state:
 # Build / load index (cache keyed by signature)
 sig = pdf_signature()
 with st.spinner("Loading PDFs + building index (first run can take a bit)..."):
-    index, chunks, meta = build_faiss_index(sig)
+    index, chunks, meta = get_index_bundle(sig)
 
 pdf_count = len([f for f in os.listdir(PDF_DIR) if f.lower().endswith(".pdf")]) if os.path.exists(PDF_DIR) else 0
 chunk_count = len(chunks)
@@ -490,3 +505,4 @@ if prompt := st.chat_input("Type your message..."):
 
             except Exception:
                 st.markdown("LLM call failed. Open Streamlit logs to see the exact status code/message.")
+
