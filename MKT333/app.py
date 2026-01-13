@@ -1,6 +1,6 @@
 ###########################################
-# MKT 333 — Beer AI & Video Games (Streamlit)
-# RAG (FAISS + SentenceTransformers) + HF Inference LLM
+# MKT 333 — Beer • AI • Video Games
+# Streamlit RAG + Hugging Face Inference (Option 3)
 ###########################################
 
 from __future__ import annotations
@@ -10,62 +10,62 @@ import re
 import json
 from typing import List, Dict, Any, Optional, Tuple
 
-import numpy as np
 import streamlit as st
 import fitz  # PyMuPDF
 import faiss
-
+import numpy as np
 from sentence_transformers import SentenceTransformer
 
-from huggingface_hub import InferenceClient, HfApi
+from huggingface_hub import HfApi
+from huggingface_hub import InferenceClient
 
 
-# =============================
-# Page config (MUST be first Streamlit call)
-# =============================
+# -----------------------------
+# Config
+# -----------------------------
+PDF_DIR = os.path.join(os.path.dirname(__file__), "pdfs")
+INDEX_DIR = os.path.join(os.path.dirname(__file__), "index")
+FAISS_PATH = os.path.join(INDEX_DIR, "faiss.index")
+META_PATH = os.path.join(INDEX_DIR, "meta.json")
+
+EMBED_MODEL_ID = "BAAI/bge-small-en-v1.5"  # embeddings
+DEFAULT_LLM_MODEL_ID = "meta-llama/Meta-Llama-3-8B-Instruct"  # pick any public instruct model
+DEFAULT_PROVIDER = "hf-inference"  # you can also try "auto" if available in your version
+
+CHUNK_MAX_CHARS = 1400
+CHUNK_OVERLAP_CHARS = 180
+TOP_K = 5
+
+
+# -----------------------------
+# Page config
+# -----------------------------
 st.set_page_config(
-    page_title="MKT 333 — Beer AI & Video Games",
+    page_title="MKT 333 — Beer • AI & Video Games",
     page_icon="🍺",
     layout="centered",
     initial_sidebar_state="expanded",
 )
 
 
-# =============================
-# CONFIG
-# =============================
-PDF_FOLDER = "./knowledge_base"  # put your PDFs here for Streamlit Cloud too
-PDF_CACHE_JSON = os.path.join(PDF_FOLDER, "pdf_data.json")
-
-EMBED_MODEL_ID = "BAAI/bge-small-en-v1.5"
-
-# IMPORTANT: this must be a GENERATIVE model for HF Inference.
-# If you use a non-chat model, this app will automatically fall back to text_generation().
-DEFAULT_LLM_MODEL_ID = "HuggingFaceH4/zephyr-7b-beta"
-
-TOP_K = 5
-CHUNK_MAX_CHARS = 1400
-CHUNK_OVERLAP = 200
-
-
-# =============================
-# HF TOKEN (env/secrets) + validation
-# =============================
+# -----------------------------
+# HF Token handling
+# -----------------------------
 def get_hf_token() -> Optional[str]:
-    # Streamlit secrets (Cloud)
+    # Streamlit Cloud secrets
     try:
         tok = st.secrets.get("HF_TOKEN", None)
-        if tok and str(tok).strip():
+        if tok:
             return str(tok).strip()
     except Exception:
         pass
 
-    # Local env vars
+    # Local env vars (PowerShell: $env:HF_TOKEN="...")
     tok = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN")
-    return tok.strip() if tok and tok.strip() else None
+    return tok.strip() if tok else None
 
 
-def validate_token(token: str) -> bool:
+def validate_hf_token(token: str) -> bool:
     try:
         HfApi().whoami(token=token)
         return True
@@ -74,25 +74,21 @@ def validate_token(token: str) -> bool:
 
 
 HF_TOKEN = get_hf_token()
-HF_TOKEN_VALID = bool(HF_TOKEN and validate_token(HF_TOKEN)) if HF_TOKEN else False
-
-if HF_TOKEN and not HF_TOKEN_VALID:
-    # Prevent “token poisoning” (invalid token causing public models to fail)
-    st.warning("HF_TOKEN is set but invalid. Continuing without token.")
-    try:
-        os.environ.pop("HF_TOKEN", None)
-        os.environ.pop("HUGGINGFACEHUB_API_TOKEN", None)
-    except Exception:
-        pass
+if HF_TOKEN and not validate_hf_token(HF_TOKEN):
+    # If token is wrong, Hugging Face requests can fail even for public models.
+    st.warning("HF_TOKEN looks invalid. Ignoring it and continuing without auth.")
     HF_TOKEN = None
+    # Also remove env vars so downstream libraries don't keep using a bad token:
+    os.environ.pop("HF_TOKEN", None)
+    os.environ.pop("HUGGINGFACEHUB_API_TOKEN", None)
 
 
-# =============================
-# PDF + TEXT UTILS
-# =============================
+# -----------------------------
+# Text cleanup / chunking
+# -----------------------------
 def clean_text(t: str) -> str:
     t = re.sub(r"\n\s*\n+", "\n", t)
-    t = re.sub(r"Page\s+\d+", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"Page\s+\d+\s*", "", t, flags=re.IGNORECASE)
     return t.strip()
 
 
@@ -100,16 +96,18 @@ def extract_text_from_pdf(pdf_path: str) -> str:
     text = ""
     with fitz.open(pdf_path) as doc:
         for page in doc:
-            raw = page.get_text("text") or ""
-            if not raw.strip():
+            t = page.get_text("text") or ""
+            if not t.strip():
                 # fallback
                 blocks = page.get_text("blocks") or []
-                raw = "\n".join([b[4] for b in blocks if len(b) > 4 and isinstance(b[4], str)])
-            text += raw + "\n"
+                t = "\n".join(
+                    [b[4] for b in blocks if len(b) > 4 and isinstance(b[4], str)]
+                )
+            text += t + "\n"
     return clean_text(text)
 
 
-def split_text(text: str, max_chars: int = CHUNK_MAX_CHARS, overlap: int = CHUNK_OVERLAP) -> List[str]:
+def split_text(text: str, max_chars: int = CHUNK_MAX_CHARS, overlap: int = CHUNK_OVERLAP_CHARS) -> List[str]:
     lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
     chunks: List[str] = []
     buf = ""
@@ -118,425 +116,275 @@ def split_text(text: str, max_chars: int = CHUNK_MAX_CHARS, overlap: int = CHUNK
         if len(buf) + len(ln) + 1 <= max_chars:
             buf += ln + "\n"
         else:
-            chunks.append(buf.strip())
+            if buf.strip():
+                chunks.append(buf.strip())
+            # overlap
             tail = buf[-overlap:] if overlap and len(buf) > overlap else ""
             buf = tail + ln + "\n"
 
     if buf.strip():
         chunks.append(buf.strip())
 
-    return [c for c in chunks if c.strip()]
+    return chunks
 
 
-def load_all_pdfs(folder_path: str) -> List[Dict[str, Any]]:
-    """
-    Loads PDFs and caches extracted text to pdf_data.json.
-    Auto-refreshes cache if PDFs change.
-    """
-    os.makedirs(folder_path, exist_ok=True)
-    current_files = [f for f in os.listdir(folder_path) if f.lower().endswith(".pdf")]
-
-    # Cache read
-    if os.path.exists(PDF_CACHE_JSON):
+def pdf_signature() -> str:
+    os.makedirs(PDF_DIR, exist_ok=True)
+    files = [f for f in os.listdir(PDF_DIR) if f.lower().endswith(".pdf")]
+    sig = []
+    for fn in sorted(files):
+        p = os.path.join(PDF_DIR, fn)
         try:
-            with open(PDF_CACHE_JSON, "r", encoding="utf-8") as f:
-                saved = json.load(f)
+            sig.append((fn, os.path.getmtime(p), os.path.getsize(p)))
+        except Exception:
+            sig.append((fn, 0, 0))
+    return json.dumps(sig)
 
-            saved_map = {x["filename"]: x for x in saved}
-            current_set = set(current_files)
-            saved_set = set(saved_map.keys())
 
-            needs_refresh = current_set != saved_set
-            if not needs_refresh:
-                for fn in current_files:
-                    p = os.path.join(folder_path, fn)
-                    if saved_map[fn].get("last_modified", 0) < os.path.getmtime(p):
-                        needs_refresh = True
-                        break
+# -----------------------------
+# Embeddings model (cached)
+# -----------------------------
+@st.cache_resource
+def get_embedder() -> SentenceTransformer:
+    # IMPORTANT: don’t hard-fail if HF_TOKEN is missing; public model should load normally.
+    return SentenceTransformer(EMBED_MODEL_ID)
 
-            if not needs_refresh:
-                return [{"filename": x["filename"], "text": x["text"]} for x in saved]
+
+# -----------------------------
+# Index build/load (cached)
+# -----------------------------
+def ensure_dirs():
+    os.makedirs(PDF_DIR, exist_ok=True)
+    os.makedirs(INDEX_DIR, exist_ok=True)
+
+
+def build_index(embedder: SentenceTransformer) -> Tuple[Optional[faiss.IndexFlatIP], List[str], List[Dict[str, Any]]]:
+    ensure_dirs()
+    files = [f for f in os.listdir(PDF_DIR) if f.lower().endswith(".pdf")]
+
+    all_chunks: List[str] = []
+    all_meta: List[Dict[str, Any]] = []
+
+    for fn in files:
+        path = os.path.join(PDF_DIR, fn)
+        txt = extract_text_from_pdf(path)
+        if not txt.strip():
+            continue
+
+        chunks = [c for c in split_text(txt) if c.strip()]
+        for i, c in enumerate(chunks):
+            all_chunks.append(c)
+            all_meta.append({"file": fn, "chunk": i})
+
+    if not all_chunks:
+        # save empty meta
+        with open(META_PATH, "w", encoding="utf-8") as f:
+            json.dump({"sig": pdf_signature(), "chunks": [], "meta": []}, f)
+        return None, [], []
+
+    embs = embedder.encode(all_chunks, convert_to_numpy=True, show_progress_bar=False).astype(np.float32)
+
+    # Use cosine similarity (normalize + inner product)
+    faiss.normalize_L2(embs)
+    dim = embs.shape[1]
+    idx = faiss.IndexFlatIP(dim)
+    idx.add(embs)
+
+    faiss.write_index(idx, FAISS_PATH)
+    with open(META_PATH, "w", encoding="utf-8") as f:
+        json.dump({"sig": pdf_signature(), "chunks": all_chunks, "meta": all_meta}, f)
+
+    return idx, all_chunks, all_meta
+
+
+@st.cache_resource
+def load_or_build_index() -> Tuple[Optional[faiss.IndexFlatIP], List[str], List[Dict[str, Any]]]:
+    ensure_dirs()
+    embedder = get_embedder()
+
+    if os.path.exists(FAISS_PATH) and os.path.exists(META_PATH):
+        try:
+            with open(META_PATH, "r", encoding="utf-8") as f:
+                blob = json.load(f)
+            if blob.get("sig") == pdf_signature():
+                idx = faiss.read_index(FAISS_PATH)
+                return idx, blob.get("chunks", []), blob.get("meta", [])
         except Exception:
             pass
 
-    # Rebuild cache
-    docs = []
-    for fn in current_files:
-        p = os.path.join(folder_path, fn)
-        txt = extract_text_from_pdf(p)
-        docs.append(
-            {
-                "filename": fn,
-                "text": txt,
-                "last_modified": os.path.getmtime(p),
-            }
-        )
-
-    with open(PDF_CACHE_JSON, "w", encoding="utf-8") as f:
-        json.dump(docs, f)
-
-    return [{"filename": d["filename"], "text": d["text"]} for d in docs]
+    return build_index(embedder)
 
 
-# =============================
-# EMBEDDINGS + FAISS (cosine)
-# =============================
-@st.cache_resource(show_spinner=True)
-def get_embedder(hf_token: Optional[str]) -> SentenceTransformer:
-    # sentence-transformers supports different kwarg names across versions;
-    # try robustly.
-    try:
-        return SentenceTransformer(EMBED_MODEL_ID, token=hf_token) if hf_token else SentenceTransformer(EMBED_MODEL_ID)
-    except TypeError:
-        return SentenceTransformer(EMBED_MODEL_ID, use_auth_token=hf_token) if hf_token else SentenceTransformer(EMBED_MODEL_ID)
-
-
-def build_vector_store(embedder: SentenceTransformer, docs: List[Dict[str, Any]]) -> Tuple[faiss.IndexFlatIP, List[str], List[Dict[str, Any]]]:
-    all_chunks: List[str] = []
-    meta: List[Dict[str, Any]] = []
-
-    for doc in docs:
-        chunks = split_text(doc["text"])
-        all_chunks.extend(chunks)
-        meta.extend([{"filename": doc["filename"], "chunk": i} for i in range(len(chunks))])
-
-    if not all_chunks:
-        # empty index
-        idx = faiss.IndexFlatIP(384)  # placeholder dim; won't be used
-        return idx, [], []
-
-    emb = embedder.encode(all_chunks, convert_to_numpy=True, show_progress_bar=False)
-    emb = np.asarray(emb, dtype=np.float32)
-
-    # cosine similarity via inner product on normalized vectors
-    faiss.normalize_L2(emb)
-
-    dim = emb.shape[1]
-    index = faiss.IndexFlatIP(dim)
-    index.add(emb)
-    return index, all_chunks, meta
-
-
-def retrieve(embedder: SentenceTransformer, index: faiss.IndexFlatIP, chunks: List[str], meta: List[Dict[str, Any]], query: str, k: int = TOP_K):
-    if not chunks:
+def retrieve(query: str, idx: Optional[faiss.IndexFlatIP], chunks: List[str], meta: List[Dict[str, Any]], k: int = TOP_K):
+    if idx is None or not chunks:
         return [], []
 
-    q = embedder.encode([query], convert_to_numpy=True, show_progress_bar=False)
-    q = np.asarray(q, dtype=np.float32)
+    embedder = get_embedder()
+    q = embedder.encode([query], convert_to_numpy=True, show_progress_bar=False).astype(np.float32)
     faiss.normalize_L2(q)
 
-    scores, idxs = index.search(q, k)
-    idxs = idxs[0].tolist()
+    scores, ids = idx.search(q, k)
+    ids = ids[0].tolist()
 
-    ctx = []
-    ctx_meta = []
-    for i in idxs:
+    picked_chunks = []
+    picked_meta = []
+    for i in ids:
         if i == -1:
             continue
-        ctx.append(chunks[i])
-        ctx_meta.append(meta[i])
-    return ctx, ctx_meta
+        picked_chunks.append(chunks[i])
+        picked_meta.append(meta[i])
+    return picked_chunks, picked_meta
 
 
-# =============================
-# HF INFERENCE (chat -> fallback to text-generation)
-# =============================
-def make_llm_client(hf_token: Optional[str]) -> InferenceClient:
-    if hf_token:
-        return InferenceClient(token=hf_token)
-    return InferenceClient()
-
-
-def build_rag_prompt(question: str, contexts: List[str], ctx_meta: List[Dict[str, Any]]) -> str:
-    # Add lightweight citations in the prompt so the model sticks to your PDFs.
-    cited_blocks = []
-    for c, m in zip(contexts, ctx_meta):
-        cited_blocks.append(f"[{m['filename']} | chunk {m['chunk']}]\n{c}")
-
-    ctx_text = "\n\n---\n\n".join(cited_blocks[:TOP_K])
-
-    return (
-        "You are a helpful course assistant. Answer ONLY using the provided PDF excerpts.\n"
-        "If the answer is not contained in the excerpts, say: \"I don’t have enough information in the PDFs to answer that.\"\n\n"
-        f"PDF EXCERPTS:\n{ctx_text}\n\n"
-        f"QUESTION: {question}\n\n"
-        "Return a clear answer and include citations like (Filename, chunk #) at the end of sentences."
+# -----------------------------
+# HF LLM call (chat -> fallback to text_generation)
+# -----------------------------
+def build_prompt(question: str, contexts: List[str], meta: List[Dict[str, Any]]) -> Tuple[List[Dict[str, str]], str]:
+    # for chat_completion
+    sys = (
+        "You are a course assistant. Answer ONLY using the provided excerpts.\n"
+        "If the answer is not in the excerpts, say: 'I don’t have enough information in the PDFs to answer that.'\n"
+        "Cite sources at the end like: (FileName.pdf, chunk 3)."
     )
+
+    ctx_lines = []
+    for c, m in zip(contexts, meta):
+        ctx_lines.append(f"[{m['file']}, chunk {m['chunk']}]\n{c}")
+
+    ctx_block = "\n\n---\n\n".join(ctx_lines) if ctx_lines else "(no excerpts)"
+
+    user = f"Question: {question}\n\nExcerpts:\n{ctx_block}\n\nAnswer:"
+
+    messages = [
+        {"role": "system", "content": sys},
+        {"role": "user", "content": user},
+    ]
+
+    # for text_generation fallback (single string)
+    flat_prompt = f"{sys}\n\n{user}"
+    return messages, flat_prompt
 
 
 def call_hf_llm(
-    client: InferenceClient,
     model_id: str,
+    provider: str,
     question: str,
     contexts: List[str],
-    ctx_meta: List[Dict[str, Any]],
+    meta: List[Dict[str, Any]],
     temperature: float = 0.2,
-    top_p: float = 0.9,
-    max_tokens: int = 700,
+    max_tokens: int = 600,
 ) -> str:
-    prompt = build_rag_prompt(question, contexts, ctx_meta)
+    client = InferenceClient(model=model_id, token=HF_TOKEN, provider=provider)
 
-    # First try chat_completion (works when model supports it / has chat template)
+    messages, flat_prompt = build_prompt(question, contexts, meta)
+
+    # 1) Try chat_completion (ONLY works if model/provider supports chat-completion)
     try:
         resp = client.chat_completion(
-            model=model_id,
-            messages=[
-                {"role": "system", "content": "You answer using only the given excerpts."},
-                {"role": "user", "content": prompt},
-            ],
+            messages=messages,
             max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
+            temperature=float(temperature),
         )
-        return resp.choices[0].message.content.strip()
+        # huggingface_hub returns an object with choices[0].message.content
+        return (resp.choices[0].message.content or "").strip()
+
     except ValueError:
-        # Model does not support chat task → fallback to text_generation
-        pass
-    except Exception:
-        # Any other HF inference issue → fallback to text_generation
-        pass
-
-    # Fallback: plain text generation endpoint
-    out = client.text_generation(
-        model=model_id,
-        prompt=prompt,
-        max_new_tokens=max_tokens,
-        temperature=temperature,
-        top_p=top_p,
-        do_sample=True,
-        return_full_text=False,
-    )
-    return (out or "").strip() or "I don’t have enough information in the PDFs to answer that."
+        # Model doesn’t support chat-completion task -> fall back to text_generation
+        # text_generation params documented here. :contentReference[oaicite:1]{index=1}
+        out = client.text_generation(
+            prompt=flat_prompt,
+            max_new_tokens=max_tokens,
+            temperature=float(temperature),
+            do_sample=(float(temperature) > 0),
+            return_full_text=False,
+        )
+        return (out or "").strip()
 
 
-# =============================
-# UI THEME (USC palette) + header
-# =============================
+# -----------------------------
+# UI
+# -----------------------------
+if "messages" not in st.session_state:
+    st.session_state.messages = [{"role": "assistant", "content": "Hi! Ask me anything from the MKT 333 PDFs. 🍺🎮🤖"}]
+
 if "ui_dark_mode" not in st.session_state:
     st.session_state.ui_dark_mode = True
 
-USC_CARDINAL = "#990000"
-USC_GOLD = "#FFCC00"
-USC_BLACK = "#000000"
-USC_WHITE = "#FFFFFF"
-USC_GRAY_30 = "#CCCCCC"
-USC_GRAY_70 = "#767676"
+if "model_config" not in st.session_state:
+    st.session_state.model_config = {"temperature": 0.2, "max_tokens": 700}
 
-if st.session_state.ui_dark_mode:
-    bg = USC_BLACK
-    panel = "rgba(0, 0, 0, 0.70)"
-    text = USC_WHITE
-    mut = USC_GRAY_30
-    border = "rgba(204, 204, 204, 0.18)"
-    accent = USC_CARDINAL
-    accent2 = USC_GOLD
-    user_bg = "rgba(0, 0, 0, 0.78)"
-    ai_bg = "rgba(153, 0, 0, 0.18)"
-    input_bg = "rgba(0, 0, 0, 0.82)"
-else:
-    bg = USC_WHITE
-    panel = "rgba(255, 255, 255, 0.96)"
-    text = USC_BLACK
-    mut = USC_GRAY_70
-    border = "rgba(118, 118, 118, 0.22)"
-    accent = USC_CARDINAL
-    accent2 = USC_GOLD
-    user_bg = "rgba(255, 255, 255, 0.98)"
-    ai_bg = "rgba(153, 0, 0, 0.08)"
-    input_bg = "rgba(255, 255, 255, 0.98)"
-
-left, right = st.columns([0.80, 0.20], vertical_alignment="center")
+# Header
+left, right = st.columns([0.85, 0.15], vertical_alignment="center")
 with left:
     st.markdown(
         """
-        <div class="top-banner">
-          <div class="hero-title">Beer • AI • Video Games</div>
-          <div class="hero-sub">Ask the course PDFs. Get clean, cited answers.</div>
+        <div style="padding:14px 16px; border:1px solid rgba(231,234,240,0.12); border-radius:16px; text-align:center;">
+          <div style="font-size:1.65rem; font-weight:900;">Beer • AI • Video Games</div>
+          <div style="opacity:0.75; margin-top:4px;">Ask the course PDFs. Get clean, cited answers.</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 with right:
-    st.session_state.ui_dark_mode = st.toggle(
-        "Dark mode" if st.session_state.ui_dark_mode else "Light mode",
-        value=st.session_state.ui_dark_mode,
-    )
+    st.session_state.ui_dark_mode = st.toggle("Dark", value=st.session_state.ui_dark_mode)
 
-st.markdown(
-    f"""
-<style>
-.stApp {{
-  background: {bg};
-  color: {text};
-}}
-.block-container {{
-  padding-top: 1.10rem;
-  max-width: 980px;
-}}
-.top-banner{{
-  background: {panel};
-  border: 1px solid {border};
-  border-left: 8px solid {accent};
-  border-bottom: 2px solid rgba(255,204,0,0.35);
-  border-radius: 18px;
-  padding: 16px 18px;
-  text-align: center;
-}}
-.hero-title{{
-  margin-top: 2px;
-  font-size: 1.55rem;
-  font-weight: 900;
-}}
-.hero-sub {{
-  margin-top: 6px;
-  font-size: 1.02rem;
-  color: {mut};
-}}
-/* chat bubbles */
-.stChatMessage {{
-  padding: 1.05rem 1.10rem;
-  border-radius: 18px;
-  margin: 0.80rem 0;
-  max-width: 88%;
-  border: 1px solid {border};
-  background: {panel};
-}}
-[data-testid="stChatMessage"][aria-label="AI"] {{
-  background: {ai_bg};
-  border: 1px solid rgba(153,0,0,0.35);
-}}
-[data-testid="stChatMessage"][aria-label="user"] {{
-  background: {user_bg};
-}}
-[data-testid="stChatMessage"] * {{
-  color: {text} !important;
-}}
-/* input */
-.stChatInput textarea {{
-  background: {input_bg} !important;
-  color: {text} !important;
-  border-radius: 16px !important;
-  border: 1px solid {border} !important;
-  font-size: 1.02rem !important;
-  line-height: 1.45 !important;
-  min-height: 72px !important;
-  padding: 14px 16px !important;
-}}
-.stChatInput textarea::placeholder {{
-  color: {mut} !important;
-}}
-</style>
-""",
-    unsafe_allow_html=True,
-)
-
-
-# =============================
-# SESSION STATE
-# =============================
-if "messages" not in st.session_state:
-    st.session_state.messages = [
-        {"role": "assistant", "content": "Hi! Ask me anything from the MKT 333 PDFs. 🍺🎮🤖"}
-    ]
-
-if "model_config" not in st.session_state:
-    st.session_state.model_config = {
-        "llm_model_id": DEFAULT_LLM_MODEL_ID,
-        "temperature": 0.2,
-        "top_p": 0.9,
-        "max_tokens": 700,
-    }
-
-
-# =============================
-# SIDEBAR
-# =============================
+# Sidebar
 with st.sidebar:
-    st.subheader("Backend / Models")
-    st.caption("HF token is optional for public models, but required for private/paid models.")
-
-    st.write(f"**HF_TOKEN detected:** {'✅' if HF_TOKEN else '❌'}")
-    st.write(f"**HF_TOKEN valid:** {'✅' if HF_TOKEN_VALID else '—'}")
-
-    st.session_state.model_config["llm_model_id"] = st.text_input(
-        "HF LLM Model ID",
-        value=st.session_state.model_config["llm_model_id"],
-        help="Must be a generative model. Example: HuggingFaceH4/zephyr-7b-beta",
-    )
-
-    st.session_state.model_config["temperature"] = st.slider(
-        "Temperature", 0.0, 1.0, float(st.session_state.model_config["temperature"]), 0.05
-    )
-    st.session_state.model_config["top_p"] = st.slider(
-        "Top-p", 0.1, 1.0, float(st.session_state.model_config["top_p"]), 0.05
-    )
-    st.session_state.model_config["max_tokens"] = st.slider(
-        "Max tokens", 128, 1200, int(st.session_state.model_config["max_tokens"]), 50
-    )
+    st.markdown("### Backend")
+    idx, chunks, meta = load_or_build_index()
+    pdf_count = len([f for f in os.listdir(PDF_DIR) if f.lower().endswith(".pdf")]) if os.path.exists(PDF_DIR) else 0
+    st.write(f"**PDFs:** {pdf_count}")
+    st.write(f"**Chunks:** {len(chunks)}")
+    st.write(f"**Indexed:** {idx is not None}")
 
     st.divider()
-    st.subheader("USC Links")
-    st.markdown("- https://www.usc.edu")
-    st.markdown("- https://www.marshall.usc.edu")
+    st.markdown("### Hugging Face LLM")
+    model_id = st.text_input("Model ID", value=DEFAULT_LLM_MODEL_ID)
+    provider = st.text_input("Provider", value=DEFAULT_PROVIDER)
 
+    st.divider()
+    st.markdown("### Settings")
+    st.session_state.model_config["temperature"] = st.slider("Temperature", 0.0, 1.0, float(st.session_state.model_config["temperature"]), 0.05)
+    st.session_state.model_config["max_tokens"] = st.slider("Max tokens", 128, 1200, int(st.session_state.model_config["max_tokens"]), 32)
 
-# =============================
-# BUILD / LOAD VECTOR STORE
-# =============================
-@st.cache_resource(show_spinner=True)
-def init_rag(hf_token: Optional[str]):
-    embedder = get_embedder(hf_token)
-    docs = load_all_pdfs(PDF_FOLDER)
-    index, chunks, meta = build_vector_store(embedder, docs)
-    return embedder, docs, index, chunks, meta
+    if st.button("🔁 Reindex PDFs"):
+        # Clear cache + rebuild on next load
+        load_or_build_index.clear()
+        st.rerun()
 
-
-embedder, docs, faiss_index, all_chunks, all_meta = init_rag(HF_TOKEN)
-
-st.caption(f"● PDFs: **{len(docs)}** | ● Chunks: **{len(all_chunks)}**")
-
-
-# =============================
-# CHAT RENDER
-# =============================
+# Chat history
 for m in st.session_state.messages:
-    with st.chat_message(m["role"]):
+    with st.chat_message("assistant" if m["role"] == "assistant" else "user"):
         st.markdown(m["content"])
 
-
-# =============================
-# ASK
-# =============================
-def answer_question(user_q: str) -> str:
-    ctx, ctx_meta = retrieve(embedder, faiss_index, all_chunks, all_meta, user_q, TOP_K)
-
-    if not ctx:
-        return "I don’t have enough information in the PDFs to answer that. Try adding the syllabus PDF into ./pdfs."
-
-    llm_client = make_llm_client(HF_TOKEN)
-    return call_hf_llm(
-        client=llm_client,
-        model_id=st.session_state.model_config["llm_model_id"],
-        question=user_q,
-        contexts=ctx,
-        ctx_meta=ctx_meta,
-        temperature=float(st.session_state.model_config["temperature"]),
-        top_p=float(st.session_state.model_config["top_p"]),
-        max_tokens=int(st.session_state.model_config["max_tokens"]),
-    )
-
-
-# =============================
-# INPUT
-# =============================
-if prompt := st.chat_input("Type your message..."):
+# Input
+prompt = st.chat_input("Type your message...")
+if prompt:
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
+    # Retrieve + Answer
+    idx, chunks, meta = load_or_build_index()
+    ctx, ctx_meta = retrieve(prompt, idx, chunks, meta, TOP_K)
+
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
-            ans = answer_question(prompt)
-        st.markdown(ans)
+            answer = call_hf_llm(
+                model_id=model_id.strip(),
+                provider=provider.strip(),
+                question=prompt,
+                contexts=ctx,
+                meta=ctx_meta,
+                temperature=float(st.session_state.model_config["temperature"]),
+                max_tokens=int(st.session_state.model_config["max_tokens"]),
+            )
 
-    st.session_state.messages.append({"role": "assistant", "content": ans})
+            # (Optional) show sources at bottom
+            if ctx_meta:
+                cites = ", ".join([f"({m['file']}, chunk {m['chunk']})" for m in ctx_meta[:3]])
+                answer = f"{answer}\n\n**Sources:** {cites}"
+
+            st.markdown(answer)
+
+    st.session_state.messages.append({"role": "assistant", "content": answer})
