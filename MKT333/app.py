@@ -28,7 +28,7 @@ PDF_DIR = os.path.join(os.path.dirname(__file__), "knowledge_base")
 EMBED_MODEL_ID = "BAAI/bge-small-en-v1.5"
 
 # HF chat model (you can override with env/secrets: HF_LLM_MODEL)
-DEFAULT_HF_LLM_MODEL = "HuggingFaceH4/zephyr-7b-beta"
+DEFAULT_HF_LLM_MODEL = "HuggingFaceTB/SmolLM2-1.7B-Instruct"
 
 CHUNK_MAX_CHARS = 1200
 CHUNK_OVERLAP = 150
@@ -505,4 +505,5 @@ if prompt := st.chat_input("Type your message..."):
 
             except Exception:
                 st.markdown("LLM call failed. Open Streamlit logs to see the exact status code/message.")
+
 
